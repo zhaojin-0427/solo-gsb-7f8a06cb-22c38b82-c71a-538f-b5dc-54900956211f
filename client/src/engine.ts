@@ -6,6 +6,9 @@
 // - 反馈双缓冲：每个「上一帧」节点持有一份历史纹理。帧内所有 prev 节点只读历史；
 //   帧尾把反馈源拷贝到一张新纹理并换页，旧纹理归还池中。因此同一帧内不存在
 //   “先写后读”的依赖，结果与遍历顺序无关，且任何一次绘制都不会读写同一纹理。
+// - 修订切换：setGraph 先在临时表中建好新输入纹理（可能失败），全部成功后才释放旧
+//   资源并换入，失败时旧修订完好可继续运行。引擎只引用 ImageBitmap、从不关闭它；
+//   位图生命周期由上层按活动/草稿所有权（ownership.ts）管理。
 // - 上下文丢失：每帧结束把历史纹理与显示纹理 readPixels 到 CPU 快照；恢复后
 //   重建全部 GL 资源并从最近完成帧继续，帧号不回退、反馈不重复推进。
 
@@ -259,7 +262,35 @@ export class Engine {
 
   // 完整候选已验证通过后调用：原子切换到新修订，帧号归零。
   // 释放旧修订独占、且新图不再使用的 GPU 资源（历史纹理、输入纹理、显示纹理）。
+  //
+  // 位图所有权约定：images 中引用的 ImageBitmap 由上层（main.ts 的活动/草稿位图表）
+  // 保证在本修订仍为活动修订期间保持打开；引擎只持有引用，从不关闭位图。这样上下文
+  // 恢复时 rebuild() 一定能据此重建输入纹理，不会用到已关闭位图。
   setGraph(g: Graph, images: Map<string, ImageBitmap>, v: Validation): void {
+    // 0) 先准备新修订的输入纹理（uploadImage 可能抛异常）。同一位图复用既有纹理，
+    //    新位图全部上传成功前不动旧修订的任何资源；中途失败则删掉本次新建的纹理并
+    //    抛出，旧修订保持可运行（其位图仍由上层活动位图表打开）。
+    const nextInputs = new Map<string, { tex: WebGLTexture | null; bmp: ImageBitmap }>();
+    const created: WebGLTexture[] = [];
+    try {
+      for (const n of g.nodes) {
+        if (n.type !== 'input') continue;
+        const bmp = images.get(n.id);
+        if (!bmp) continue;
+        const reused = this.inputTextures.get(n.id);
+        if (reused && reused.bmp === bmp) {
+          nextInputs.set(n.id, reused);
+        } else {
+          const tex = this.lost ? null : this.uploadImage(bmp);
+          if (tex) created.push(tex);
+          nextInputs.set(n.id, { tex, bmp });
+        }
+      }
+    } catch (err) {
+      if (!this.lost) for (const tex of created) this.gl.deleteTexture(tex);
+      throw err;
+    }
+
     // 1) 反馈历史：新修订从第零帧开始，历史必须重置为透明
     if (!this.lost) for (const h of this.histories.values()) this.pool.release(h.tex);
     this.histories.clear();
@@ -269,26 +300,15 @@ export class Engine {
     }
     this.displayCpu = null;
 
-    // 2) 输入纹理：同一位图复用，不再使用的删除
-    const next = new Map<string, { tex: WebGLTexture | null; bmp: ImageBitmap }>();
-    for (const n of g.nodes) {
-      if (n.type !== 'input') continue;
-      const bmp = images.get(n.id);
-      if (!bmp) continue;
-      const old = this.inputTextures.get(n.id);
-      if (old && old.bmp === bmp) {
-        next.set(n.id, old);
-        this.inputTextures.delete(n.id);
-      } else {
-        next.set(n.id, { tex: this.lost ? null : this.uploadImage(bmp), bmp });
-      }
-    }
+    // 2) 换入新输入纹理；旧修订不再使用（且未被复用）的纹理才删除
+    const oldInputs = this.inputTextures;
+    const keptTex = new Set([...nextInputs.values()].map((e) => e.tex));
+    this.inputTextures = nextInputs;
     if (!this.lost) {
-      for (const old of this.inputTextures.values()) {
-        if (old.tex) this.gl.deleteTexture(old.tex);
+      for (const old of oldInputs.values()) {
+        if (old.tex && !keptTex.has(old.tex)) this.gl.deleteTexture(old.tex);
       }
     }
-    this.inputTextures = next;
 
     // 3) 尺寸变化：纹理池整体作废（空闲纹理全部删除）
     const sizeChanged = !this.graph || this.graph.width !== g.width || this.graph.height !== g.height;
@@ -475,7 +495,9 @@ export class Engine {
     this.loseExt?.restoreContext();
   }
 
-  // 恢复后重建全部 GL 资源，从最近完成帧继续（帧号不动、反馈不重复推进）
+  // 恢复后重建全部 GL 资源，从最近完成帧继续（帧号不动、反馈不重复推进）。
+  // 输入纹理按活动修订持有的位图重建：上层保证这些位图在活动修订存活期间从不关闭
+  //（候选被拒绝 / 放弃草稿 / 过期上传都不会动活动位图），因此恢复不会丢输入。
   private rebuild(): void {
     this.initGL();
     for (const e of this.inputTextures.values()) e.tex = this.uploadImage(e.bmp);

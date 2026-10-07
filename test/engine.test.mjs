@@ -30,7 +30,7 @@ const C = {
 };
 
 class FakeGL {
-  constructor() {
+  constructor(opts = {}) {
     this.texSeq = 0;
     this.readPixelsCount = 0;
     this.draws = 0;
@@ -38,6 +38,8 @@ class FakeGL {
     this.boundTex = new Map(); // unit -> tex
     this.activeUnit = 0;
     this.deletedTextures = [];
+    this.uploadedBmps = []; // 6 参 texImage2D 上传过的源位图（按顺序）
+    this.failBmp = opts.failBmp ?? null; // 上传该位图时抛错，模拟 GPU 分配失败
     this.loseExt = {
       lost: false,
       loseContext: () => { this.loseExt.lost = true; },
@@ -63,7 +65,14 @@ class FakeGL {
   framebufferTexture2D(target, attach, texTarget, tex) { this.fboAttachment = tex; }
   createTexture() { return { id: ++this.texSeq }; }
   bindTexture(target, tex) { this.boundTex.set(this.activeUnit, tex); }
-  texImage2D() {}
+  texImage2D(target, level, ifmt, w, h, borderOrSrc, fmtOrType, type, src) {
+    // 位图上传为 6 参：(…, SRGB8_ALPHA8, RGBA, UNSIGNED_BYTE, ImageBitmap)，位图在第 6 参；
+    // 纹理分配为 9 参，第 9 参为 null / Uint8Array。
+    if (arguments.length === 6 && borderOrSrc && typeof borderOrSrc === 'object') {
+      this.uploadedBmps.push(borderOrSrc);
+      if (borderOrSrc === this.failBmp) throw new Error('模拟位图上传失败');
+    }
+  }
   texParameteri() {}
   pixelStorei() {}
   disable() {}
@@ -94,6 +103,8 @@ class FakeGL {
     }
   }
 }
+
+function bmp(label) { return { label, close() {} }; }
 
 function makeCanvas(gl) {
   const listeners = new Map();
@@ -242,6 +253,50 @@ t('上下文丢失后暂停推进，恢复后从最近完成帧继续且不重�
   engine.runFrame();
   assert.equal(engine.lastFrame, 3);
   assert.equal(engine.frame, 4);
+});
+
+t('新位图上传失败：setGraph 抛出且旧修订完好，可继续出帧', () => {
+  const gl = new FakeGL();
+  const engine = new Engine(makeCanvas(gl));
+  const oldBmp = bmp('old');
+  commit(engine, feedbackGraph(), new Map([['img', oldBmp]]));
+  engine.runFrame();
+  assert.equal(engine.stats().inputs, 1);
+  assert.equal(gl.uploadedBmps[0], oldBmp);
+
+  // 同一输入换一张新位图，但上传抛错（模拟 GPU 资源分配失败）
+  const badBmp = bmp('bad');
+  gl.failBmp = badBmp;
+  const g2 = feedbackGraph();
+  const v2 = validateGraph(g2, { hasImage: () => true });
+  assert.ok(v2.ok);
+  assert.throws(() => engine.setGraph(g2, new Map([['img', badBmp]]), v2), /上传失败/);
+  gl.failBmp = null;
+
+  // 旧修订状态完好：输入仍是旧位图，帧号未归零，继续出帧不抛错
+  assert.equal(engine.stats().inputs, 1);
+  assert.equal(engine.lastFrame, 0);
+  engine.runFrame();
+  assert.equal(engine.lastFrame, 1, '失败后旧修订必须仍能继续运行');
+});
+
+t('上下文恢复沿用活动修订位图重建输入，不重复推进帧', () => {
+  const gl = new FakeGL();
+  const canvas = makeCanvas(gl);
+  const engine = new Engine(canvas);
+  const img = bmp('active-png');
+  commit(engine, feedbackGraph(), new Map([['img', img]]));
+  engine.runFrame();
+
+  canvas.fire('webglcontextlost');
+  assert.equal(engine.lost, true);
+  canvas.fire('webglcontextrestored');
+  assert.equal(engine.lost, false);
+  // 重建时必须用活动修订一直打开的那张位图上传（已关闭位图在此会失败/丢图）
+  assert.ok(gl.uploadedBmps.includes(img), '恢复未用活动修订位图重建输入');
+  assert.equal(engine.lastFrame, 0, '恢复不得推进反馈');
+  engine.runFrame();
+  assert.equal(engine.lastFrame, 1);
 });
 
 t('导出行翻转正确（GL 底行在前 -> PNG 顶行在前）', () => {
