@@ -1,9 +1,11 @@
 // main.ts —— 应用装配：草稿编辑 -> 完整候选验证 -> 原子提交新修订（帧归零）。
 // 失败时保留旧修订继续运行；旧修订的异步上传/导出回调不会覆盖新结果。
+// 输入位图的所有权（草稿 / 活动修订双重视角）见 bitmaps.ts。
 
 import { Graph, emptyGraph, validateGraph, NodeType } from './graph.js';
 import { Engine } from './engine.js';
 import { Editor } from './editor.js';
+import { BitmapStore } from './bitmaps.js';
 import * as Examples from './examples.js';
 
 function $<T extends HTMLElement>(sel: string): T {
@@ -20,7 +22,9 @@ let draft: Graph = emptyGraph();
 let active: Graph | null = null;   // 正在运行的修订对应的图
 let revision = 0;                  // 当前修订号（每次成功提交 +1）
 let running = true;
-const images = new Map<string, ImageBitmap>(); // nodeId -> CPU 位图（上传后一直持有）
+// 位图所有权：草稿与活动修订各自持有引用，两者都不再引用的位图才会被关闭，
+// 因此活动修订在候选被拒绝 / 放弃草稿 / 过期上传返回时仍能预览、导出与重建上下文。
+const store = new BitmapStore();
 const uploadTokens = new Map<string, number>();
 let draftEpoch = 0; // 草稿被整体替换（示例/放弃草稿）时 +1，用于作废旧异步回调
 
@@ -30,29 +34,26 @@ let draftEpoch = 0; // 草稿被整体替换（示例/放弃草稿）时 +1，�
 function commitDraft(): boolean {
   if (!engine) return false;
   const candidate: Graph = structuredClone(draft);
-  const v = validateGraph(candidate, { hasImage: (id) => images.has(id) });
+  const v = validateGraph(candidate, { hasImage: (id) => store.draft.has(id) });
   editor.setIssues(v.errors, v.warnings);
   showErrors(v.ok ? [] : v.errors.map((e) => e.message));
   if (!v.ok) {
+    // 候选被拒绝：不动任何位图，活动修订继续用原输入预览 / 导出 / 恢复上下文
     setStatus(`候选被拒绝，旧修订 r${revision} 继续运行（帧 ${engine.lastFrame}）`);
     return false;
   }
   try {
-    engine.setGraph(candidate, images, v);
+    engine.setGraph(candidate, store.draft, v);
   } catch (err) {
     showErrors([`GPU 资源分配失败：${String(err)}`]);
     setStatus(`新修订启用失败，旧修订 r${revision} 继续运行`);
     return false;
   }
+  // —— 新修订已完整验证并成功启用，此后才允许关闭不再被任一修订使用的位图 ——
   active = candidate;
   revision++;
-  // 释放不再属于任何节点的 CPU 位图
-  for (const [id, bmp] of images) {
-    if (!candidate.nodes.some((n) => n.id === id)) {
-      bmp.close();
-      images.delete(id);
-    }
-  }
+  store.promote(candidate);
+  store.retainDraft(candidate);
   setStatus(`修订 r${revision} 已启用，从第 0 帧开始`);
   return true;
 }
@@ -83,8 +84,10 @@ async function onUpload(nodeId: string, file: File): Promise<void> {
     setStatus('已丢弃过期的上传结果');
     return;
   }
-  images.get(nodeId)?.close();
-  images.set(nodeId, bmp);
+  // 不提前关闭旧位图：若随后的候选被拒绝，活动修订仍靠它预览 / 导出 / 重建上下文。
+  // 草稿无效时新位图也由草稿继续持有，可继续编辑后再提交。
+  store.setDraft(nodeId, bmp);
+  editor.setGraph(draft, new Set(store.draft.keys()));
   commitDraft();
 }
 
@@ -127,19 +130,22 @@ async function loadExample(kind: 'basic' | 'feedback' | 'cycle'): Promise<void> 
   draft = ex.graph;
   $<HTMLInputElement>('#in-w').value = String(draft.width);
   $<HTMLInputElement>('#in-h').value = String(draft.height);
-  // 清理不再属于草稿的位图
-  for (const [id, bmp] of images) {
-    if (!draft.nodes.some((n) => n.id === id)) { bmp.close(); images.delete(id); }
-  }
-  editor.setGraph(draft, new Set(images.keys()));
+  // 只释放草稿独占位图；活动修订仍在用的位图必须保留（候选可能被拒绝，
+  // 上下文恢复还要靠它重建输入纹理）
+  store.retainDraft(draft);
+  editor.setGraph(draft, new Set(store.draft.keys()));
   commitDraft(); // 先提交结构（循环示例会在这里被拒绝，旧修订继续运行）
-  if (ex.imageNodeId) {
+  const imgId = ex.imageNodeId;
+  if (imgId) {
     try {
       const bmp = await Examples.makeDemoImage();
-      if (myEpoch !== draftEpoch) { bmp.close(); return; } // 已被更新的替换作废
-      images.get(ex.imageNodeId)?.close();
-      images.set(ex.imageNodeId, bmp);
-      editor.setGraph(draft, new Set(images.keys()));
+      // 已被更新的草稿替换作废，或节点已不在草稿中
+      if (myEpoch !== draftEpoch || !draft.nodes.some((n) => n.id === imgId)) {
+        bmp.close();
+        return;
+      }
+      store.setDraft(imgId, bmp);
+      editor.setGraph(draft, new Set(store.draft.keys()));
       commitDraft(); // 图像就绪，再启用一个修订
     } catch {
       setStatus('演示图像生成失败');
@@ -252,10 +258,12 @@ function main(): void {
   $('#btn-revert').addEventListener('click', () => {
     draft = active ? structuredClone(active) : emptyGraph();
     draftEpoch++;
+    // 位图视图回滚到活动修订：只释放草稿独占位图，活动修订的输入不受影响
+    store.revertToActive();
     wIn.value = String(draft.width);
     hIn.value = String(draft.height);
-    editor.setGraph(draft, new Set(images.keys()));
-    const v = validateGraph(draft, { hasImage: (id) => images.has(id) });
+    editor.setGraph(draft, new Set(store.draft.keys()));
+    const v = validateGraph(draft, { hasImage: (id) => store.draft.has(id) });
     editor.setIssues(v.errors, v.warnings);
     showErrors([]);
     setStatus(`已放弃草稿更改，回到修订 r${revision}`);

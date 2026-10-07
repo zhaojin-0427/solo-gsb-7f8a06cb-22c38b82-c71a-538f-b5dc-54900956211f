@@ -18,7 +18,7 @@ docker compose up --build
 npm install
 npm run build     # 编译 client/src -> client/dist
 npm start         # http://localhost:8080
-npm test          # 图校验纯逻辑单元测试（14 例）
+npm test          # 纯逻辑单元测试（图校验 14 + 引擎 9 + 位图所有权 8）
 ```
 
 健康检查：`GET /api/health` 返回 `{"ok":true,...}`。
@@ -31,7 +31,8 @@ npm test          # 图校验纯逻辑单元测试（14 例）
 3. **暂停 / 单步 / 导出 / 继续**：共用同一帧编号。导出文件名为 `frame-XXXX-rN.png`，
    内容为当前显示帧的普通 sRGB PNG（直出 alpha）。
 4. **循环拒绝示例**：点「循环拒绝」，底部红条显示同帧循环依赖错误，**旧修订继续运行**
-   （修订号不变、帧号不归零）。点「放弃草稿」回到活动修订。
+   （修订号不变、帧号不归零，已加载的输入图像仍属于旧修订，上下文丢失恢复后不丢失）。
+   点「放弃草稿」回到活动修订。
 5. **修订语义**：任意修改（连线、参数、尺寸、上传）都会把草稿作为完整候选验证；
    成功后修订号 +1 并从第 0 帧重启；失败保留旧图。
 6. **上下文丢失**：点「模拟上下文丢失」→ 出现黄色横幅，画面冻结、帧号不变；
@@ -67,6 +68,10 @@ npm test          # 图校验纯逻辑单元测试（14 例）
 - 上传/示例图像的异步解码用「节点令牌 + 草稿代次」防护：过期回调直接丢弃，
   不会覆盖新修订；导出的像素在点击瞬间同步捕获，`toBlob` 回调只下载自己的快照。
 - 暂停、单步、导出、继续都使用同一帧计数器（`lastFrame`/`frame`）。
+- **位图所有权**（`bitmaps.ts`）：每张输入位图同时按「草稿视角」与「活动修订视角」记账，
+  两个视角都不再引用时才 `close()`。因此候选被拒绝、放弃草稿或过期上传返回时，
+  活动修订的位图保持存活（上下文恢复仍用它重建输入纹理）；候选完整验证并成功启用后，
+  才关闭不再被任一修订使用的旧位图；放弃草稿只释放草稿独占的位图。
 
 ### 上下文丢失
 - 「模拟上下文丢失」调用 `WEBGL_lose_context.loseContext()`；每帧结束已把历史纹理与
@@ -78,6 +83,7 @@ npm test          # 图校验纯逻辑单元测试（14 例）
 
 ```
 client/src/graph.ts    图数据结构 + 校验（纯逻辑，可单测）
+client/src/bitmaps.ts  输入位图在草稿/活动修订间的所有权（纯逻辑，可单测）
 client/src/shaders.ts  全部 GLSL（线性/预乘管线）
 client/src/engine.ts   WebGL2 引擎：纹理池、反馈双缓冲、上下文恢复
 client/src/editor.ts   节点编辑器（DOM+SVG）
@@ -85,4 +91,6 @@ client/src/examples.ts 内置示例（半透明反馈 / 基础链 / 循环拒绝
 client/src/main.ts     装配：草稿->候选->原子提交、播放控制、导出
 server/server.js       零依赖静态服务器（/api/health）
 test/graph.test.mjs    校验逻辑单元测试
+test/engine.test.mjs   引擎集成测试（伪 GL）
+test/bitmaps.test.mjs  位图所有权单元测试
 ```
